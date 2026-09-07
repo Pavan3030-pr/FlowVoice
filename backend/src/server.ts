@@ -1,11 +1,9 @@
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import { WebSocketServer, WebSocket } from "ws";
 import { RequestManager } from "./state/RequestManager";
 import { searchHotels } from "./tools/hotel";
-
-dotenv.config();
+import { understandUser } from "./ai";
 
 const app = express();
 
@@ -54,200 +52,97 @@ function sendEvent(
   );
 }
 
-/**
- * Extract the user's intended city.
- *
- * Examples:
- *
- * "find hotels in Hyderabad"
- * → Hyderabad
- *
- * "find hotels in Hyderabad actually Bangalore"
- * → Bangalore
- *
- * "Hyderabad no actually in Bangalore"
- * → Bangalore
- *
- * "search Delhi instead of Mumbai"
- * → Mumbai
- *
- * "find hotels in Chennai"
- * → Chennai
- */
-function extractCity(text: string): string {
-  const cities = [
-    "Hyderabad",
-    "Bangalore",
-    "Bengaluru",
-    "Chennai",
-    "Mumbai",
-    "Delhi",
-    "Pune",
-  ];
-
-  const lowerText = text.toLowerCase();
-
-  /*
-   * STEP 1
-   *
-   * Look for correction language.
-   *
-   * If the user says:
-   *
-   * "actually Bangalore"
-   * "no actually Bangalore"
-   * "Bangalore instead"
-   *
-   * we want the city AFTER the correction.
-   */
-  const correctionPatterns = [
-    "no actually",
-    "actually",
-    "instead",
-    "rather",
-    "make that",
-    "change that to",
-    "wait",
-    "sorry",
-    "no",
-  ];
-
-  let correctionPosition = -1;
-  let correctionLength = 0;
-
-  for (const phrase of correctionPatterns) {
-    const position = lowerText.lastIndexOf(phrase);
-
-    if (position > correctionPosition) {
-      correctionPosition = position;
-      correctionLength = phrase.length;
-    }
-  }
-
-  /*
-   * If a correction phrase exists,
-   * search for a city AFTER it.
-   */
-  if (correctionPosition !== -1) {
-    const afterCorrection = lowerText.slice(
-      correctionPosition + correctionLength
-    );
-
-    let correctedCity = "";
-
-    let correctedCityPosition = -1;
-
-    for (const city of cities) {
-      const position = afterCorrection.lastIndexOf(
-        city.toLowerCase()
-      );
-
-      if (position > correctedCityPosition) {
-        correctedCityPosition = position;
-        correctedCity = city;
-      }
-    }
-
-    if (correctedCity) {
-      return correctedCity;
-    }
-  }
-
-  /*
-   * STEP 2
-   *
-   * No correction detected.
-   *
-   * If multiple cities exist in the sentence,
-   * use the LAST city mentioned.
-   *
-   * Example:
-   *
-   * "Hyderabad then Bangalore"
-   *
-   * → Bangalore
-   */
-  let lastCity = "Hyderabad";
-  let lastCityPosition = -1;
-
-  for (const city of cities) {
-    const position = lowerText.lastIndexOf(
-      city.toLowerCase()
-    );
-
-    if (position > lastCityPosition) {
-      lastCityPosition = position;
-      lastCity = city;
-    }
-  }
-
-  return lastCity;
-}
-
-/**
- * Handle a complete voice request.
- */
 async function handleUserRequest(
   socket: WebSocket,
   text: string
 ) {
-  console.log(
-    `🗣️ USER REQUEST: "${text}"`
-  );
-
-  const city = extractCity(text);
-
-  console.log(
-    `🧠 UNDERSTOOD CITY: ${city}`
-  );
+  console.log("");
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log(`🗣️ USER SAID: "${text}"`);
+  console.log("🧠 Sending request to Gemini...");
 
   /*
-   * Every new request receives a new generation.
-   *
-   * This is what allows FlowVoice to discard
-   * old/stale tool results.
+   * STEP 1
+   * Ask Gemini to understand the COMPLETE sentence.
+   */
+  let understanding;
+
+  try {
+    understanding = await understandUser(text);
+
+    console.log(
+      "🤖 GEMINI UNDERSTANDING:",
+      understanding
+    );
+  } catch (error) {
+    console.error(
+      "❌ Gemini understanding failed:",
+      error
+    );
+
+    sendEvent(socket, "AI_ERROR", {
+      message: "AI understanding failed",
+    });
+
+    return;
+  }
+
+  /*
+   * STEP 2
+   * Get the city understood by Gemini.
+   */
+  const city =
+    typeof understanding.city === "string"
+      ? understanding.city
+      : "Hyderabad";
+
+  const reply =
+    typeof understanding.reply === "string"
+      ? understanding.reply
+      : `Searching for hotels in ${city}.`;
+
+  /*
+   * STEP 3
+   * Start a NEW generation.
    */
   const generation =
     requestManager.startRequest();
 
-  sendEvent(
-    socket,
-    "REQUEST_STARTED",
-    {
-      generation,
-      text,
-      city,
-    }
+  console.log(
+    `🟢 NEW REQUEST: Generation ${generation}`
   );
 
-  sendEvent(
-    socket,
-    "TOOL_STARTED",
-    {
-      generation,
-      tool: "hotel_search",
-      city,
-    }
-  );
+  /*
+   * Tell frontend what AI understood.
+   */
+  sendEvent(socket, "REQUEST_STARTED", {
+    generation,
+    text,
+    city,
+    reply,
+  });
+
+  /*
+   * STEP 4
+   * Start hotel search.
+   */
+  sendEvent(socket, "TOOL_STARTED", {
+    generation,
+    tool: "hotel_search",
+    city,
+  });
 
   console.log(
     `🔎 Searching hotels in ${city}...`
   );
 
   try {
-    const hotels =
-      await searchHotels(city);
+    const hotels = await searchHotels(city);
 
     /*
-     * IMPORTANT:
-     *
-     * The user may have spoken again
-     * while the hotel search was running.
-     *
-     * If that happened, this generation
-     * is no longer current.
-     *
-     * Therefore DO NOT show this result.
+     * STEP 5
+     * Check whether the user interrupted
+     * this request while the tool was running.
      */
     if (
       !requestManager.isCurrent(
@@ -258,183 +153,163 @@ async function handleUserRequest(
         `❌ STALE RESULT: ${city} | Generation ${generation}`
       );
 
-      sendEvent(
-        socket,
-        "STALE_RESULT",
-        {
-          generation,
-          city,
-        }
-      );
+      sendEvent(socket, "STALE_RESULT", {
+        generation,
+        city,
+      });
 
       return;
     }
 
     /*
+     * STEP 6
      * Current result is valid.
      */
     console.log(
       `✅ CURRENT RESULT: ${city} | Generation ${generation}`
     );
 
-    sendEvent(
-      socket,
-      "TOOL_RESULT",
-      {
-        generation,
-        tool: "hotel_search",
-        city,
-        hotels,
-      }
+    sendEvent(socket, "TOOL_RESULT", {
+      generation,
+      tool: "hotel_search",
+      city,
+      hotels,
+    });
+
+    /*
+     * Send AI's natural response.
+     */
+    sendEvent(socket, "AI_RESPONSE", {
+      generation,
+      text: reply,
+      city,
+    });
+
+    console.log(
+      `🗣️ AI: "${reply}"`
     );
+
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   } catch (error) {
     console.error(
       "❌ Hotel search failed:",
       error
     );
 
-    sendEvent(
-      socket,
-      "TOOL_ERROR",
-      {
-        generation,
-        tool: "hotel_search",
-        city,
-        message:
-          "Hotel search failed",
-      }
-    );
+    sendEvent(socket, "TOOL_ERROR", {
+      generation,
+      tool: "hotel_search",
+      city,
+      message: "Hotel search failed",
+    });
   }
 }
 
-/**
- * WebSocket connection.
- */
-wss.on(
-  "connection",
-  (socket) => {
-    console.log(
-      "🔌 WebSocket client connected"
-    );
+wss.on("connection", (socket) => {
+  console.log(
+    "🔌 WebSocket client connected"
+  );
 
-    sendEvent(
-      socket,
-      "CONNECTED",
-      {
-        message:
-          "FlowVoice realtime connection established",
-      }
-    );
+  sendEvent(socket, "CONNECTED", {
+    message:
+      "FlowVoice realtime connection established",
+  });
 
-    socket.on(
-      "message",
-      (message) => {
-        try {
-          const data =
-            JSON.parse(
-              message.toString()
-            );
+  socket.on("message", (message) => {
+    try {
+      const data = JSON.parse(
+        message.toString()
+      );
 
+      console.log(
+        "📩 Event received:",
+        data
+      );
+
+      /*
+       * MAIN VOICE FLOW
+       *
+       * Frontend sends:
+       *
+       * USER_SPOKE
+       *
+       * Backend → Gemini
+       * Gemini → intent/city/reply
+       * Backend → hotel tool
+       */
+      if (
+        data.type === "USER_SPOKE"
+      ) {
+        if (
+          typeof data.text !==
+          "string"
+        ) {
           console.log(
-            "📩 Event received:",
-            data
+            "❌ Invalid USER_SPOKE event"
           );
 
-          /*
-           * USER SPOKE
-           *
-           * This is the main voice-agent path.
-           */
-          if (
-            data.type ===
-            "USER_SPOKE"
-          ) {
-            if (
-              typeof data.text !==
-              "string"
-            ) {
-              console.log(
-                "❌ Invalid USER_SPOKE event"
-              );
-
-              return;
-            }
-
-            handleUserRequest(
-              socket,
-              data.text
-            );
-
-            return;
-          }
-
-          /*
-           * USER INTERRUPTED
-           *
-           * Make the previous generation
-           * obsolete immediately.
-           */
-          if (
-            data.type ===
-            "USER_INTERRUPTED"
-          ) {
-            const generation =
-              requestManager.interrupt();
-
-            console.log(
-              `🛑 Request interrupted → Generation ${generation}`
-            );
-
-            sendEvent(
-              socket,
-              "USER_INTERRUPTED",
-              {
-                generation,
-                message:
-                  "Previous request is now obsolete",
-              }
-            );
-
-            return;
-          }
-
-          /*
-           * We don't need the frontend
-           * to manually start requests.
-           *
-           * Voice → USER_SPOKE →
-           * backend starts the request.
-           */
-
-          console.log(
-            `ℹ️ Ignored event type: ${data.type}`
-          );
-        } catch (error) {
-          console.error(
-            "❌ Invalid WebSocket message:",
-            error
-          );
+          return;
         }
-      }
-    );
 
-    socket.on(
-      "close",
-      () => {
+        handleUserRequest(
+          socket,
+          data.text
+        );
+
+        return;
+      }
+
+      /*
+       * INTERRUPTION
+       *
+       * Immediately invalidate
+       * the current generation.
+       */
+      if (
+        data.type ===
+        "USER_INTERRUPTED"
+      ) {
+        const generation =
+          requestManager.interrupt();
+
         console.log(
-          "🔌 WebSocket client disconnected"
+          `🛑 REQUEST INTERRUPTED → Generation ${generation}`
         );
-      }
-    );
 
-    socket.on(
-      "error",
-      (error) => {
-        console.error(
-          "❌ WebSocket error:",
-          error
+        sendEvent(
+          socket,
+          "USER_INTERRUPTED",
+          {
+            generation,
+            message:
+              "Previous request is now obsolete",
+          }
         );
+
+        return;
       }
+
+      console.log(
+        `ℹ️ Ignored event type: ${data.type}`
+      );
+    } catch (error) {
+      console.error(
+        "❌ Invalid WebSocket message:",
+        error
+      );
+    }
+  });
+
+  socket.on("close", () => {
+    console.log(
+      "🔌 WebSocket client disconnected"
     );
-  }
-);
+  });
+
+  socket.on("error", (error) => {
+    console.error(
+      "❌ WebSocket error:",
+      error
+    );
+  });
+});
