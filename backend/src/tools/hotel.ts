@@ -4,11 +4,10 @@ export interface Hotel {
   price: number;
 }
 
-export async function searchHotels(city: string): Promise<Hotel[]> {
+export async function searchHotels(
+  city: string
+): Promise<Hotel[]> {
   console.log(`🔎 Searching hotels in ${city}...`);
-
-  // Simulate a slow external API
-  await new Promise((resolve) => setTimeout(resolve, 5000));
 
   const hotels: Hotel[] = [
     {
@@ -28,7 +27,9 @@ export async function searchHotels(city: string): Promise<Hotel[]> {
     },
   ];
 
-  console.log(`✅ Hotel search completed for ${city}`);
+  console.log(
+    `✅ Hotel search completed for ${city}`
+  );
 
   return hotels;
 }

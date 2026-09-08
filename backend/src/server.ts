@@ -1,9 +1,15 @@
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
 import { WebSocketServer, WebSocket } from "ws";
+
 import { RequestManager } from "./state/RequestManager";
 import { searchHotels } from "./tools/hotel";
+import { searchRestaurants } from "./tools/restaurant";
+import { searchWeb } from "./tools/webSearch";
 import { understandUser } from "./ai";
+
+dotenv.config();
 
 const app = express();
 
@@ -52,97 +58,75 @@ function sendEvent(
   );
 }
 
+/**
+ * Send the final response from the AI agent.
+ */
+function sendAgentResponse(
+  socket: WebSocket,
+  generation: number,
+  reply: string
+) {
+  sendEvent(socket, "AGENT_RESPONSE", {
+    generation,
+    reply,
+  });
+
+  console.log(`🤖 AGENT: "${reply}"`);
+}
+
+/**
+ * Handle a complete voice request.
+ *
+ * Flow:
+ *
+ * USER_SPOKE
+ *      ↓
+ * Gemini understands request
+ *      ↓
+ * Select tool
+ *      ↓
+ * Tool executes
+ *      ↓
+ * Result returned
+ *      ↓
+ * AGENT_RESPONSE
+ */
 async function handleUserRequest(
   socket: WebSocket,
   text: string
 ) {
   console.log("");
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log(`🗣️ USER SAID: "${text}"`);
-  console.log("🧠 Sending request to Gemini...");
+  console.log("════════════════════════════════");
+  console.log(`🗣️ USER: "${text}"`);
+  console.log("════════════════════════════════");
 
   /*
-   * STEP 1
-   * Ask Gemini to understand the COMPLETE sentence.
-   */
-  let understanding;
-
-  try {
-    understanding = await understandUser(text);
-
-    console.log(
-      "🤖 GEMINI UNDERSTANDING:",
-      understanding
-    );
-  } catch (error) {
-    console.error(
-      "❌ Gemini understanding failed:",
-      error
-    );
-
-    sendEvent(socket, "AI_ERROR", {
-      message: "AI understanding failed",
-    });
-
-    return;
-  }
-
-  /*
-   * STEP 2
-   * Get the city understood by Gemini.
-   */
-  const city =
-    typeof understanding.city === "string"
-      ? understanding.city
-      : "Hyderabad";
-
-  const reply =
-    typeof understanding.reply === "string"
-      ? understanding.reply
-      : `Searching for hotels in ${city}.`;
-
-  /*
-   * STEP 3
-   * Start a NEW generation.
+   * Start a new generation immediately.
+   *
+   * This makes the previous request obsolete.
    */
   const generation =
     requestManager.startRequest();
 
-  console.log(
-    `🟢 NEW REQUEST: Generation ${generation}`
-  );
-
-  /*
-   * Tell frontend what AI understood.
-   */
   sendEvent(socket, "REQUEST_STARTED", {
     generation,
     text,
-    city,
-    reply,
   });
-
-  /*
-   * STEP 4
-   * Start hotel search.
-   */
-  sendEvent(socket, "TOOL_STARTED", {
-    generation,
-    tool: "hotel_search",
-    city,
-  });
-
-  console.log(
-    `🔎 Searching hotels in ${city}...`
-  );
 
   try {
-    const hotels = await searchHotels(city);
+    /*
+     * STEP 1
+     *
+     * Ask Gemini what the user wants.
+     */
+    console.log("🧠 Asking Gemini...");
+
+    const understanding =
+      await understandUser(text);
 
     /*
-     * STEP 5
      * Check whether the user interrupted
-     * this request while the tool was running.
+     * while Gemini was thinking.
      */
     if (
       !requestManager.isCurrent(
@@ -150,166 +134,520 @@ async function handleUserRequest(
       )
     ) {
       console.log(
-        `❌ STALE RESULT: ${city} | Generation ${generation}`
+        `⚠️ Gemini result became stale | Generation ${generation}`
       );
 
-      sendEvent(socket, "STALE_RESULT", {
-        generation,
-        city,
-      });
+      sendEvent(
+        socket,
+        "STALE_RESULT",
+        {
+          generation,
+          message:
+            "AI understanding became obsolete",
+        }
+      );
 
       return;
     }
 
-    /*
-     * STEP 6
-     * Current result is valid.
-     */
     console.log(
-      `✅ CURRENT RESULT: ${city} | Generation ${generation}`
+      "🧠 Gemini understanding:",
+      understanding
     );
 
-    sendEvent(socket, "TOOL_RESULT", {
-      generation,
-      tool: "hotel_search",
-      city,
-      hotels,
-    });
+    sendEvent(
+      socket,
+      "AI_UNDERSTOOD",
+      {
+        generation,
+        intent: understanding.intent,
+        query: understanding.query,
+        city: understanding.city ?? null,
+        reply: understanding.reply,
+      }
+    );
 
     /*
-     * Send AI's natural response.
+     * STEP 2
+     *
+     * Decide which tool should execute.
      */
-    sendEvent(socket, "AI_RESPONSE", {
-      generation,
-      text: reply,
-      city,
-    });
-
-    console.log(
-      `🗣️ AI: "${reply}"`
-    );
-
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  } catch (error) {
-    console.error(
-      "❌ Hotel search failed:",
-      error
-    );
-
-    sendEvent(socket, "TOOL_ERROR", {
-      generation,
-      tool: "hotel_search",
-      city,
-      message: "Hotel search failed",
-    });
-  }
-}
-
-wss.on("connection", (socket) => {
-  console.log(
-    "🔌 WebSocket client connected"
-  );
-
-  sendEvent(socket, "CONNECTED", {
-    message:
-      "FlowVoice realtime connection established",
-  });
-
-  socket.on("message", (message) => {
-    try {
-      const data = JSON.parse(
-        message.toString()
-      );
-
-      console.log(
-        "📩 Event received:",
-        data
-      );
-
+    switch (understanding.intent) {
       /*
-       * MAIN VOICE FLOW
-       *
-       * Frontend sends:
-       *
-       * USER_SPOKE
-       *
-       * Backend → Gemini
-       * Gemini → intent/city/reply
-       * Backend → hotel tool
+       * ═══════════════════════════════
+       * HOTEL SEARCH
+       * ═══════════════════════════════
        */
-      if (
-        data.type === "USER_SPOKE"
-      ) {
+      case "hotel_search": {
+        const city =
+          understanding.city || "Hyderabad";
+
+        console.log(
+          `🏨 HOTEL REQUEST: ${understanding.query}`
+        );
+
+        sendEvent(
+          socket,
+          "TOOL_STARTED",
+          {
+            generation,
+            tool: "hotel_search",
+            city,
+          }
+        );
+
+        console.log(
+          `🔎 TOOL: hotel_search(${city})`
+        );
+
+        const hotels =
+          await searchHotels(city);
+
+        /*
+         * User may have spoken again
+         * while hotel search was running.
+         */
         if (
-          typeof data.text !==
-          "string"
+          !requestManager.isCurrent(
+            generation
+          )
         ) {
           console.log(
-            "❌ Invalid USER_SPOKE event"
+            `⚠️ HOTEL RESULT STALE | ${city}`
+          );
+
+          sendEvent(
+            socket,
+            "STALE_RESULT",
+            {
+              generation,
+              city,
+              tool: "hotel_search",
+            }
           );
 
           return;
         }
 
-        handleUserRequest(
-          socket,
-          data.text
-        );
-
-        return;
-      }
-
-      /*
-       * INTERRUPTION
-       *
-       * Immediately invalidate
-       * the current generation.
-       */
-      if (
-        data.type ===
-        "USER_INTERRUPTED"
-      ) {
-        const generation =
-          requestManager.interrupt();
-
         console.log(
-          `🛑 REQUEST INTERRUPTED → Generation ${generation}`
+          `✅ HOTEL RESULT | ${city} | Generation ${generation}`
         );
 
         sendEvent(
           socket,
-          "USER_INTERRUPTED",
+          "TOOL_RESULT",
           {
             generation,
-            message:
-              "Previous request is now obsolete",
+            tool: "hotel_search",
+            city,
+            hotels,
           }
         );
 
-        return;
+        /*
+         * Create a natural agent response.
+         */
+        const cheapest =
+          hotels.length > 0
+            ? hotels.reduce((lowest, hotel) =>
+                hotel.price < lowest.price
+                  ? hotel
+                  : lowest
+              )
+            : null;
+
+        let hotelReply =
+          `I found ${hotels.length} hotels in ${city}.`;
+
+        if (cheapest) {
+          hotelReply +=
+            ` The cheapest option is ${cheapest.name} at ₹${cheapest.price}.`;
+        }
+
+        sendAgentResponse(
+          socket,
+          generation,
+          hotelReply
+        );
+
+        break;
       }
 
-      console.log(
-        `ℹ️ Ignored event type: ${data.type}`
-      );
-    } catch (error) {
-      console.error(
-        "❌ Invalid WebSocket message:",
-        error
-      );
+      /*
+       * ═══════════════════════════════
+       * RESTAURANT SEARCH
+       * ═══════════════════════════════
+       */
+      case "restaurant_search": {
+        const city =
+          understanding.city || "Hyderabad";
+
+        console.log(
+          `🍽️ RESTAURANT REQUEST: ${understanding.query}`
+        );
+
+        sendEvent(
+          socket,
+          "TOOL_STARTED",
+          {
+            generation,
+            tool: "restaurant_search",
+            city,
+          }
+        );
+
+        console.log(
+          `🔎 TOOL: restaurant_search(${city})`
+        );
+
+        const restaurants =
+          await searchRestaurants(
+            city,
+            understanding.query
+          );
+
+        /*
+         * Check for interruption.
+         */
+        if (
+          !requestManager.isCurrent(
+            generation
+          )
+        ) {
+          console.log(
+            `⚠️ RESTAURANT RESULT STALE | ${city}`
+          );
+
+          sendEvent(
+            socket,
+            "STALE_RESULT",
+            {
+              generation,
+              city,
+              tool: "restaurant_search",
+            }
+          );
+
+          return;
+        }
+
+        console.log(
+          `✅ RESTAURANT RESULT | ${city} | Generation ${generation}`
+        );
+
+        sendEvent(
+          socket,
+          "TOOL_RESULT",
+          {
+            generation,
+            tool: "restaurant_search",
+            city,
+            restaurants,
+          }
+        );
+
+        /*
+         * Natural response.
+         */
+        let restaurantReply =
+          `I found ${restaurants.length} restaurants in ${city}.`;
+
+        if (restaurants.length > 0) {
+          restaurantReply +=
+            ` One option is ${restaurants[0].name}, serving ${restaurants[0].cuisine}.`;
+        }
+
+        sendAgentResponse(
+          socket,
+          generation,
+          restaurantReply
+        );
+
+        break;
+      }
+
+      /*
+       * ═══════════════════════════════
+       * WEB SEARCH
+       * ═══════════════════════════════
+       */
+      case "web_search": {
+        console.log(
+          `🌐 WEB SEARCH REQUEST: ${understanding.query}`
+        );
+
+        sendEvent(
+          socket,
+          "TOOL_STARTED",
+          {
+            generation,
+            tool: "web_search",
+            query: understanding.query,
+          }
+        );
+
+        console.log(
+          `🌐 TOOL: web_search("${understanding.query}")`
+        );
+
+        const webResult =
+          await searchWeb(
+            understanding.query
+          );
+
+        /*
+         * Check for interruption.
+         */
+        if (
+          !requestManager.isCurrent(
+            generation
+          )
+        ) {
+          console.log(
+            `⚠️ WEB RESULT STALE | Generation ${generation}`
+          );
+
+          sendEvent(
+            socket,
+            "STALE_RESULT",
+            {
+              generation,
+              tool: "web_search",
+            }
+          );
+
+          return;
+        }
+
+        console.log(
+          `✅ WEB RESULT | Generation ${generation}`
+        );
+
+        sendEvent(
+          socket,
+          "TOOL_RESULT",
+          {
+            generation,
+            tool: "web_search",
+            answer: webResult.answer,
+            sources:
+              webResult.sources,
+          }
+        );
+
+        /*
+         * Send the actual web answer
+         * back to the frontend.
+         */
+        sendAgentResponse(
+          socket,
+          generation,
+          webResult.answer
+        );
+
+        break;
+      }
+
+      /*
+       * ═══════════════════════════════
+       * GENERAL QUESTION
+       * ═══════════════════════════════
+       */
+      case "general_question": {
+        console.log(
+          `💬 GENERAL QUESTION: ${understanding.query}`
+        );
+
+        /*
+         * For Phase 1, Gemini's understanding
+         * gives us the response.
+         *
+         * Later we can add a dedicated
+         * conversational response generation
+         * layer.
+         */
+        sendEvent(
+          socket,
+          "GENERAL_RESPONSE",
+          {
+            generation,
+            query: understanding.query,
+          }
+        );
+
+        sendAgentResponse(
+          socket,
+          generation,
+          understanding.reply
+        );
+
+        break;
+      }
+
+      default: {
+        console.log(
+          "⚠️ Unknown intent:",
+          understanding.intent
+        );
+
+        sendAgentResponse(
+          socket,
+          generation,
+          "I'm not sure how to help with that yet."
+        );
+      }
     }
-  });
-
-  socket.on("close", () => {
-    console.log(
-      "🔌 WebSocket client disconnected"
-    );
-  });
-
-  socket.on("error", (error) => {
+  } catch (error) {
     console.error(
-      "❌ WebSocket error:",
+      "❌ REQUEST FAILED:",
       error
     );
-  });
-});
+
+    /*
+     * Don't crash the server.
+     */
+    sendEvent(
+      socket,
+      "AGENT_ERROR",
+      {
+        generation,
+        message:
+          "Sorry, something went wrong while processing your request.",
+      }
+    );
+
+    sendAgentResponse(
+      socket,
+      generation,
+      "Sorry, I couldn't complete that request."
+    );
+  }
+}
+
+/**
+ * WebSocket connection.
+ */
+wss.on(
+  "connection",
+  (socket) => {
+    console.log(
+      "🔌 WebSocket client connected"
+    );
+
+    sendEvent(
+      socket,
+      "CONNECTED",
+      {
+        message:
+          "FlowVoice realtime connection established",
+      }
+    );
+
+    socket.on(
+      "message",
+      (message) => {
+        try {
+          const data =
+            JSON.parse(
+              message.toString()
+            );
+
+          console.log(
+            "📩 Event received:",
+            data
+          );
+
+          /*
+           * USER SPOKE
+           *
+           * Main voice-agent path.
+           */
+          if (
+            data.type ===
+            "USER_SPOKE"
+          ) {
+            if (
+              typeof data.text !==
+                "string" ||
+              !data.text.trim()
+            ) {
+              console.log(
+                "❌ Invalid USER_SPOKE event"
+              );
+
+              return;
+            }
+
+            handleUserRequest(
+              socket,
+              data.text.trim()
+            );
+
+            return;
+          }
+
+          /*
+           * USER INTERRUPTED
+           *
+           * Immediately make the
+           * current generation obsolete.
+           */
+          if (
+            data.type ===
+            "USER_INTERRUPTED"
+          ) {
+            const generation =
+              requestManager.interrupt();
+
+            console.log(
+              `🛑 Request interrupted → Generation ${generation}`
+            );
+
+            sendEvent(
+              socket,
+              "USER_INTERRUPTED",
+              {
+                generation,
+                message:
+                  "Previous request is now obsolete",
+              }
+            );
+
+            return;
+          }
+
+          /*
+           * Unknown events.
+           */
+          console.log(
+            `ℹ️ Ignored event type: ${data.type}`
+          );
+        } catch (error) {
+          console.error(
+            "❌ Invalid WebSocket message:",
+            error
+          );
+        }
+      }
+    );
+
+    socket.on(
+      "close",
+      () => {
+        console.log(
+          "🔌 WebSocket client disconnected"
+        );
+      }
+    );
+
+    socket.on(
+      "error",
+      (error) => {
+        console.error(
+          "❌ WebSocket error:",
+          error
+        );
+      }
+    );
+  }
+);
